@@ -160,3 +160,4 @@ cython_debug/
 #.idea/
 usage_report.xlsx
 usage_report.csv
+usage_report.xlsx
