@@ -58,7 +58,7 @@ async def fetch_usage(account):
 
         # 2) WAIT FOR NETWORK IDLE + RENDER
         await page.wait_for_load_state("networkidle")
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
         # 3) SCRAPE BALANCE (numeric only)
         balance_locator = page.locator(
