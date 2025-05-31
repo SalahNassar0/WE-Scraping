@@ -357,7 +357,7 @@ async def main():
         interval_minutes = 10
         summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
-        now = datetime.now().replace(hour=11, minute=55)
+        #now = datetime.now().replace(hour=11, minute=55)
         if summary_window_start <= now <= summary_window_end:
             logging.info(f"Current time {now.strftime('%H:%M')} is within the 12 PM summary window. Sending daily summary Slack report ONLY.")
             summary_report_parts = [f"*📊 Daily Usage Report Summary ({pd.Timestamp.now().strftime('%Y-%m-%d %I:%M %p')})*"]
@@ -381,7 +381,7 @@ async def main():
                 for alert_msg in unique_individual_alerts: send_slack_message(alert_msg); await asyncio.sleep(1)
             else:
                 logging.info("No individual data-driven alerts. Sending 'All Clear' message to Slack.")
-                all_clear_message = f":sparkles: Woohoo! Your {now.strftime('%I:%M %p')} usage check is complete, and guess what? Everything is looking absolutely splendid! :rocket: Go ahead and enjoy your day, worry-free! :tada:"
+                all_clear_message = f"🎉 Good news! Your friendly Usage Watchdog just completed its {now.strftime('%I:%M %p')} rounds, and all accounts are A-OK! :dog2::shield: Time to relax and enjoy the peace of mind! ✨"
                 send_slack_message(all_clear_message)
 
     # --- Prepare DataFrame for Excel Output ---
@@ -446,7 +446,7 @@ async def main():
     interval_minutes_email = 10 
     email_window_start = target_email_time - timedelta(minutes=interval_minutes_email)
     email_window_end = target_email_time + timedelta(minutes=interval_minutes_email)
-    now_for_email = datetime.now().replace(hour=11, minute=55)
+    #now_for_email = datetime.now().replace(hour=11, minute=55)
     if email_window_start <= now_for_email <= email_window_end:
         logging.info(f"Current time {now_for_email.strftime('%H:%M')} is within the email window. Attempting to send email report.")
         yag = None
