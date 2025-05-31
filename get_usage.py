@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, PatternFill, Font
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.formatting.rule import Rule
-from datetime import datetime, timedelta # Ensure timedelta is imported
+from datetime import datetime, timedelta
 import yagmail
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -26,6 +26,14 @@ logging.basicConfig(
 )
 
 load_dotenv()
+
+# ── Browser Launch Arguments ─────────────────────────────────────────────────
+BROWSER_LAUNCH_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage', # Often useful in constrained Linux environments
+    '--disable-gpu',           # Good for headless
+]
 
 # ── Slack settings ───────────────────────────────────────────────────────────
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
@@ -44,9 +52,7 @@ EMAIL_RECIPIENTS = [
     if addr.strip()
 ]
 TO_ADDRS = EMAIL_RECIPIENTS or ([EMAIL_RECIPIENT] if EMAIL_RECIPIENT else [])
-# Removed the raise RuntimeError for no email recipients, as email is now optional based on time
-# if not TO_ADDRS:
-#     raise RuntimeError("No email recipient configured! Set EMAIL_RECIPIENT or EMAIL_RECIPIENTS in .env")
+# Not raising error for no email recipients as email sending is time-conditional
 
 # ── Conditional Formatting Thresholds ────────────────────────────────────────
 LOW_REMAINING_YELLOW_GB = float(os.getenv("LOW_REMAINING_YELLOW_GB", "80"))
@@ -67,21 +73,23 @@ while os.getenv(f"ACCOUNT{i}_PHONE"):
 if not accounts:
     logging.warning("No accounts configured! Please set ACCOUNT1_PHONE, ACCOUNT1_PASS, etc., in .env")
 
-# ── Scraper ──────────────────────────────────────────────────────────────────
-async def fetch_usage(account): # Assuming BROWSER_LAUNCH_ARGS is defined globally or you pass specific args if needed
-    # This function uses its own Playwright instance as per the provided code.
-    # If switching to a shared browser instance, this function's signature and internal Playwright setup would change.
-    # For now, keeping it as provided by the user.
-    p_local = None # Renamed to avoid conflict if p is global
-    browser_local = None # Renamed
+# ── Scraper (Modified for shared browser) ──────────────────────────────────
+async def fetch_usage(account, browser): # Accepts shared browser instance
     page = None
+    context = None
     try:
-        logging.info(f"Attempting to fetch usage for {account['store']} ({account['phone']})")
-        p_local = await async_playwright().start()
-        # Consider adding args=['--no-sandbox'] etc. if running in restricted Linux env
-        browser_local = await p_local.chromium.launch(headless=True) 
-        page    = await browser_local.new_page()
-
+        logging.info(f"Processing account: {account['store']} ({account['phone']}) using shared browser")
+        # Create a new incognito-like context for each task for isolation
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/90.0.4430.212 Safari/537.36" # Example user agent
+            )
+        )
+        page = await context.new_page()
+        
+        logging.info(f"Navigating to login for {account['phone']}")
         await page.goto("https://my.te.eg/echannel/#/login", timeout=60000)
         await page.fill('input[placeholder="Service number"]', account["phone"])
         await page.click(".ant-select-selector")
@@ -91,7 +99,7 @@ async def fetch_usage(account): # Assuming BROWSER_LAUNCH_ARGS is defined global
         logging.info(f"Login initiated for {account['phone']}")
 
         await page.wait_for_load_state("networkidle", timeout=60000)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(3000) # Give elements time to fully render
         logging.info(f"Dashboard loaded for {account['phone']}")
 
         balance = "0"
@@ -104,104 +112,69 @@ async def fetch_usage(account): # Assuming BROWSER_LAUNCH_ARGS is defined global
                 await bal_loc.wait_for(timeout=5000)
                 txt = (await bal_loc.text_content() or "").strip().split()[0]
                 if txt and txt != "0":
-                    balance = txt
-                    logging.info(f"Balance found for {account['phone']}: {balance}")
-                    break
+                    balance = txt; logging.info(f"Balance found for {account['phone']}: {balance}"); break
             except Exception as e:
                 logging.warning(f"Attempt {attempt}/3 to get Balance for {account['phone']} failed: {e}")
                 if attempt < 3: await page.wait_for_timeout(1000)
-        if balance == "0":
-            logging.warning(f"Could not reliably scrape Balance for {account['phone']} or it is '0'. Defaulting to 0.")
-            balance = "0"
+        if balance == "0": logging.warning(f"Could not reliably scrape Balance for {account['phone']} or it is '0'. Defaulting to 0."); balance = "0"
 
         remaining = 0.0
-        rem_loc = page.locator(
-            '//span[contains(.,"Remaining")]/preceding-sibling::span[1]'
-        ).first
+        rem_loc = page.locator('//span[contains(.,"Remaining")]/preceding-sibling::span[1]').first
         for attempt in range(1, 4):
             try:
                 await rem_loc.wait_for(timeout=5000)
                 val_str = (await rem_loc.text_content() or "0").strip()
                 remaining = float(re.sub(r'[^\d.]', '', val_str))
-                logging.info(f"Remaining found for {account['phone']}: {remaining}")
-                break
+                logging.info(f"Remaining found for {account['phone']}: {remaining}"); break
             except Exception as e:
                 logging.warning(f"Attempt {attempt}/3 to get Remaining for {account['phone']} failed: {e}")
                 if attempt < 3: await page.wait_for_timeout(1000)
-        if remaining == 0.0:
-            logging.warning(f"Could not reliably scrape Remaining for {account['phone']}. Defaulting to 0.0.")
+        if remaining == 0.0: logging.warning(f"Could not reliably scrape Remaining for {account['phone']}. Defaulting to 0.0.")
 
         used = 0.0
-        # Assuming 'Used' might not always be present or could be 0.0 if not found.
-        # The df processing in main() handles 'Used' column creation if it's missing from initial rows.
         try:
-            used_loc = page.locator(
-                '//span[contains(.,"Used")]/preceding-sibling::span[1]'
-            ).first
+            used_loc = page.locator('//span[contains(.,"Used")]/preceding-sibling::span[1]').first
             for attempt in range(1, 4):
                 try:
                     await used_loc.wait_for(timeout=5000)
                     val_str = (await used_loc.text_content() or "0").strip()
                     used = float(re.sub(r'[^\d.]', '', val_str))
-                    logging.info(f"Used found for {account['phone']}: {used}")
-                    break
+                    logging.info(f"Used found for {account['phone']}: {used}"); break
                 except Exception as e:
                     logging.warning(f"Attempt {attempt}/3 to get Used for {account['phone']} failed: {e}")
                     if attempt < 3: await page.wait_for_timeout(1000)
-            if used == 0.0 and not (await used_loc.is_visible(timeout=1000)): # Check if it defaulted because element wasn't there
+            if used == 0.0 and not (await used_loc.is_visible(timeout=1000)):
                  logging.info(f"'Used' data not found for {account['phone']}, will default to 0.0.")
         except Exception:
             logging.info(f"'Used' data locator not found for {account['phone']}, defaulting to 0.0.")
             used = 0.0
 
-
-        renewal_cost = "0"
-        renewal_date = ""
-        addon_names_str = "N/A"
-        addon_prices_str = "N/A"
-
+        renewal_cost = "0"; renewal_date = ""; addon_names_str = "N/A"; addon_prices_str = "N/A"
         try:
-            more_details_locators = [
-                page.locator('//span[text()="More Details"]').first,
-                page.locator('//a[.//span[contains(text(),"details")]] | //button[.//span[contains(text(),"details")]]').first
-            ]
+            more_details_locators = [page.locator('//span[text()="More Details"]').first, page.locator('//a[.//span[contains(text(),"details")]] | //button[.//span[contains(text(),"details")]]').first]
             more_details_clicked = False
             for md_loc in more_details_locators:
                 try:
-                    await md_loc.wait_for(state='visible', timeout=5000)
-                    await md_loc.click()
-                    more_details_clicked = True
-                    logging.info(f"Clicked 'More Details' (or similar) for {account['phone']}")
-                    break
-                except Exception:
-                    logging.debug(f"More details locator variant failed for {account['phone']}")
-            if not more_details_clicked:
-                raise Exception("All 'More Details' locator variants failed or timed out for clicking.")
-
-            await page.wait_for_load_state("networkidle", timeout=30000)
-            await page.wait_for_timeout(3000)
-
-            addon_names_list = []
-            addon_prices_list_scraped = []
+                    await md_loc.wait_for(state='visible', timeout=5000); await md_loc.click(); more_details_clicked = True
+                    logging.info(f"Clicked 'More Details' (or similar) for {account['phone']}"); break
+                except Exception: logging.debug(f"More details locator variant failed for {account['phone']}")
+            if not more_details_clicked: raise Exception("All 'More Details' locator variants failed or timed out for clicking.")
+            await page.wait_for_load_state("networkidle", timeout=30000); await page.wait_for_timeout(3000)
+            addon_names_list = []; addon_prices_list_scraped = []
             not_subscribed_locator = page.locator('//span[contains(normalize-space(.), "You are not subscribed to any bundles currently")]')
             try:
                 await not_subscribed_locator.wait_for(timeout=3000, state="visible")
                 logging.info(f"Message 'You are not subscribed to any bundles currently' found for {account['phone']}.")
             except Exception:
                 logging.info(f"'Not subscribed' message NOT found for {account['phone']}. Looking for add-on cards.")
-                addon_card_selector = (
-                    '//div[contains(@class, "slick-slide") and @aria-hidden="false"]'
-                    '//div[contains(@style, "border-style: solid") and contains(@style, "border-color: var(--ec-brand-primary)")]'
-                )
-                addon_cards = page.locator(addon_card_selector)
-                num_addon_cards = await addon_cards.count()
+                addon_card_selector = ('//div[contains(@class, "slick-slide") and @aria-hidden="false"]//div[contains(@style, "border-style: solid") and contains(@style, "border-color: var(--ec-brand-primary)")]')
+                addon_cards = page.locator(addon_card_selector); num_addon_cards = await addon_cards.count()
                 logging.info(f"Found {num_addon_cards} potential add-on card(s) for {account['phone']}.")
                 for i in range(num_addon_cards):
                     card = addon_cards.nth(i); name_text_cleaned = "N/A"; price_text_raw = "N/A"
                     try:
                         name_loc = card.locator('xpath=.//div[contains(@style, "font-size: var(--ec-title-h7)") and contains(@style, "font-weight: bold;")]').first
-                        await name_loc.wait_for(timeout=3000, state="visible")
-                        name_text_original = (await name_loc.text_content() or "").strip()
+                        await name_loc.wait_for(timeout=3000, state="visible"); name_text_original = (await name_loc.text_content() or "").strip()
                         name_text_cleaned = name_text_original if name_text_original else "N/A"
                     except Exception as e: logging.warning(f"Could not get add-on name for card {i+1} for {account['phone']}: {e}")
                     try:
@@ -249,20 +222,16 @@ async def fetch_usage(account): # Assuming BROWSER_LAUNCH_ARGS is defined global
 
         return {"Store": account["store"], "Number": account["phone"], "Balance": f"{balance} EGP", "Remaining": remaining, "Used": used, "Add-ons": addon_names_str, "Add-ons Price": addon_prices_str, "Renewal Cost": f"{renewal_cost} EGP", "Renewal Date": renewal_date}
     except Exception as e:
-        logging.error(f"Critical error fetching usage for {account['store']} ({account['phone']}): {e}", exc_info=True)
-        return {"Store": account["store"], "Number": account["phone"], "Balance": "0 EGP", "Remaining": 0.0, "Used": 0.0, "Add-ons": "N/A", "Add-ons Price": "N/A", "Renewal Cost": "0 EGP", "Renewal Date": ""}
+        logging.error(f"Critical error in fetch_usage for {account['store']} ({account['phone']}): {e}", exc_info=True)
+        return {"Store": account["store"], "Number": account["phone"], "Balance": "Error EGP", "Remaining": 0.0, "Used": 0.0, "Add-ons": "Error", "Add-ons Price": "Error", "Renewal Cost": "Error EGP", "Renewal Date": "Error"}
     finally:
-        if page: 
+        if page:
             try: await page.close()
-            except Exception: pass # Ignore errors on page close
-        if browser_local: # Use the renamed variable
-            try: await browser_local.close()
-            except Exception: pass
-        if p_local: # Use the renamed variable
-            try: await p_local.stop()
-            except Exception: pass
-        logging.info(f"Finished processing {account['phone']}.")
-
+            except Exception as e_pc: logging.debug(f"Error closing page for {account['phone']}: {e_pc}")
+        if context:
+            try: await context.close()
+            except Exception as e_cc: logging.debug(f"Error closing context for {account['phone']}: {e_cc}")
+        logging.info(f"Finished processing task for {account['phone']}.") # More generic than "Finished processing [phone]"
 
 def parse_egp_string(cost_str):
     if not isinstance(cost_str, str) or cost_str.lower() == "n/a":
@@ -279,14 +248,13 @@ def parse_egp_string(cost_str):
     return total_value
 
 def send_slack_message(message_text):
-    """Sends a message to the configured Slack channel."""
     if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
         logging.warning("Slack token or channel ID is missing. Cannot send Slack message.")
         return False
     try:
         client = WebClient(token=SLACK_BOT_TOKEN)
         client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=message_text)
-        logging.info(f"Message sent to Slack channel {SLACK_CHANNEL_ID}.")
+        logging.info(f"Message sent to Slack channel {SLACK_CHANNEL_ID}.") # Removed message_text for brevity
         return True
     except SlackApiError as e:
         logging.error(f"Error sending message to Slack: {e.response['error']}")
@@ -294,29 +262,50 @@ def send_slack_message(message_text):
 
 async def main():
     logging.info("Starting web scraping process...")
-
     if not accounts:
-        logging.warning("No accounts found in .env file. Exiting.")
-        return
+        logging.warning("No accounts found in .env file. Exiting."); return
 
-    # If you intend to use a single browser instance for all fetch_usage calls (recommended for EC2):
-    # BROWSER_LAUNCH_ARGS = [ '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
-    # async with async_playwright() as p:
-    #     browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
-    #     tasks = [fetch_usage(ac, browser) for ac in accounts] # Modify fetch_usage to accept browser
-    #     rows = await asyncio.gather(*tasks)
-    #     await browser.close()
-    # else: # Current approach: each fetch_usage launches its own browser
-    rows = await asyncio.gather(*(fetch_usage(ac) for ac in accounts))
+    # Single browser instance strategy
+    async with async_playwright() as p:
+        browser = None # Initialize browser to None
+        try:
+            logging.info("Playwright started. Launching a single browser instance...")
+            browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
+            logging.info("Single browser instance launched.")
+
+            tasks = [fetch_usage(ac, browser) for ac in accounts]
+            rows = await asyncio.gather(*tasks)
+            
+        except Exception as e:
+            logging.error(f"Error during Playwright browser setup or scraping tasks: {e}", exc_info=True)
+            # Create error rows if scraping failed fundamentally
+            rows = [{
+                "Store": acc["store"], "Number": acc["phone"], "Balance": "Scrape Error",
+                "Remaining": 0, "Used": 0, "Add-ons": "Scrape Error", "Add-ons Price": "Scrape Error",
+                "Renewal Cost": "Scrape Error", "Renewal Date": "Scrape Error"
+            } for acc in accounts]
+        # ...
+        finally:
+            if browser: # Check if browser object exists
+                try:
+                    if browser.is_connected(): # A more common way to check if it's still active
+                        logging.info("Closing browser instance...")
+                        await browser.close()
+                    else:
+                        logging.info("Browser was not connected or already closed.")
+                except Exception as e:
+                    logging.error(f"Error trying to close browser: {e}")
+            # p.stop() is handled by 'async with'
+            logging.info("Playwright operations finished.")
         
-    logging.info(f"Finished scraping {len(rows)} accounts.")
+        logging.info(f"Finished scraping phase. Processed {len(rows)} potential account data sets.")
 
     df = pd.DataFrame(rows)
-
     if df.empty:
-        logging.warning("No data scraped. DataFrame is empty.")
+        logging.warning("DataFrame is empty after scraping. Exiting.")
         return
 
+    # --- Process DataFrame for Calculations and Alerts ---
     df["Balance Numeric"] = df["Balance"].apply(parse_egp_string)
     df["Renewal Cost Numeric"] = df["Renewal Cost"].apply(parse_egp_string)
     df["Add-ons Price Numeric"] = df["Add-ons Price"].apply(parse_egp_string)
@@ -328,11 +317,14 @@ async def main():
     df["Main Quota"] = df["Remaining"] + df["Used"]
     logging.info("DataFrame processed for alert logic.")
 
-    individual_alerts_to_send = []
+    # --- SLACK ALERTS AND REPORTING LOGIC ---
+    # ... (This entire block from your last provided script for Slack alerts,
+    #      including STAGE 1 and STAGE 2 with time checks, goes here) ...
+    individual_alerts_to_send = [] 
     low_gb_alert_count = 0
     renewal_low_balance_alert_count = 0
 
-    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID: 
         logging.info("Gathering data for all potential alerts...")
         for index, row in df.iterrows():
             if pd.notna(row['Remaining']) and row['Remaining'] < LOW_REMAINING_RED_GB:
@@ -384,6 +376,7 @@ async def main():
                 all_clear_message = f":sparkles: Woohoo! Your {now.strftime('%I:%M %p')} usage check is complete, and guess what? Everything is looking absolutely splendid! :rocket: Go ahead and enjoy your day, worry-free! :tada:"
                 send_slack_message(all_clear_message)
 
+    # --- Prepare DataFrame for Excel Output ---
     df_for_excel = df.copy()
     df_for_excel["Balance"] = df["Balance Numeric"]; df_for_excel["Renewal Cost"] = df["Renewal Cost Numeric"]
     df_for_excel["Add-ons Price"] = df["Add-ons Price Numeric"]; df_for_excel["Total Cost"] = df["Total Cost Numeric"]
@@ -394,6 +387,7 @@ async def main():
     df_for_excel.to_excel(excel_path, index=False, sheet_name="Usage")
     logging.info(f"Data exported to {excel_path}.")
 
+    # --- Styling with openpyxl ---
     wb = load_workbook(excel_path); ws = wb.active; center = Alignment(horizontal="center", vertical="center")
     for row_cells in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row_cells: cell.alignment = center
@@ -412,12 +406,13 @@ async def main():
         else: logging.warning(f"Column header '{col_name}' not found for EGP number formatting.")
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    if "Balance" in col_letters:
+    if "Balance" in col_letters: # This should use the main df's numeric columns for comparison logic
         balance_col_letter_in_excel = col_letters["Balance"]
-        for df_idx in range(len(df)):
+        for df_idx in range(len(df)): # Iterate using original df's length
             excel_row_num = df_idx + 2
             try:
-                balance_val = df.loc[df_idx, 'Balance Numeric']; total_cost_val = df.loc[df_idx, 'Total Cost Numeric']
+                balance_val = df.loc[df_idx, 'Balance Numeric'] # Use Numeric from original df
+                total_cost_val = df.loc[df_idx, 'Total Cost Numeric'] # Use Numeric from original df
                 balance_cell_in_excel = ws[f"{balance_col_letter_in_excel}{excel_row_num}"]
                 epsilon = 1e-9
                 if balance_val < (total_cost_val - epsilon): balance_cell_in_excel.fill = red_fill
@@ -437,13 +432,12 @@ async def main():
     logging.info("Excel file styled.")
     wb.save(excel_path)
 
+    # --- Time-Restricted Email Sending ---
     now_for_email = datetime.now()
     target_email_time = now_for_email.replace(hour=12, minute=0, second=0, microsecond=0)
     interval_minutes_email = 10 
     email_window_start = target_email_time - timedelta(minutes=interval_minutes_email)
     email_window_end = target_email_time + timedelta(minutes=interval_minutes_email)
-     # For testing:
-    now_for_email = datetime.now().replace(hour=11, minute=55)
     if email_window_start <= now_for_email <= email_window_end:
         logging.info(f"Current time {now_for_email.strftime('%H:%M')} is within the email window. Attempting to send email report.")
         yag = None
