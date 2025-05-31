@@ -349,7 +349,7 @@ async def main():
         interval_minutes = 10
         summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
-
+        now = datetime.now().replace(hour=12, minute=5) # Test summary window
         if summary_window_start <= now <= summary_window_end:
             logging.info(f"Current time {now.strftime('%H:%M')} is within the 12 PM summary window. Sending daily summary Slack report ONLY.")
             summary_report_parts = [f"*📊 Daily Usage Report Summary ({pd.Timestamp.now().strftime('%Y-%m-%d %I:%M %p')})*"]
@@ -438,6 +438,7 @@ async def main():
     interval_minutes_email = 10 
     email_window_start = target_email_time - timedelta(minutes=interval_minutes_email)
     email_window_end = target_email_time + timedelta(minutes=interval_minutes_email)
+    now_for_email = datetime.now().replace(hour=11, minute=55)
     if email_window_start <= now_for_email <= email_window_end:
         logging.info(f"Current time {now_for_email.strftime('%H:%M')} is within the email window. Attempting to send email report.")
         yag = None
