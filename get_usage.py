@@ -10,7 +10,10 @@ from openpyxl import load_workbook
 from openpyxl.styles import Alignment, PatternFill, Font
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.formatting.rule import Rule
+from datetime import datetime, timedelta
 import yagmail
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 # ── Configure Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -23,6 +26,13 @@ logging.basicConfig(
 )
 
 load_dotenv()
+
+# ── Slack settings ───────────────────────────────────────────────────────────
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID")
+
+if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+    logging.warning("Slack Bot Token or Channel ID not found in .env. Slack alerts will be disabled.")
 
 # ── Email settings ────────────────────────────────────────────────────────────
 EMAIL_SENDER     = os.getenv("EMAIL_SENDER")
@@ -318,6 +328,24 @@ def parse_egp_string(cost_str):
                 logging.warning(f"Could not parse numeric part '{numeric_part}' from '{part}' to float.")
     return total_value
 
+def send_slack_message(message_text):
+    """Sends a message to the configured Slack channel."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        logging.warning("Slack token or channel ID is missing. Cannot send message.")
+        return False
+
+    try:
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        response = client.chat_postMessage(
+            channel=SLACK_CHANNEL_ID,
+            text=message_text
+        )
+        logging.info(f"Message sent to Slack channel {SLACK_CHANNEL_ID}: {message_text}")
+        return True
+    except SlackApiError as e:
+        logging.error(f"Error sending message to Slack: {e.response['error']}")
+        return False
+
 async def main():
     logging.info("Starting web scraping process...")
 
@@ -334,151 +362,201 @@ async def main():
         logging.warning("No data scraped. DataFrame is empty. Email will not be sent.")
         return
 
-    # Create numeric columns for calculation
+    # --- Process DataFrame for Calculations and Alerts ---
     df["Balance Numeric"] = df["Balance"].apply(parse_egp_string)
     df["Renewal Cost Numeric"] = df["Renewal Cost"].apply(parse_egp_string)
     df["Add-ons Price Numeric"] = df["Add-ons Price"].apply(parse_egp_string)
     df["Total Cost Numeric"] = df["Renewal Cost Numeric"] + df["Add-ons Price Numeric"]
-
-    # Overwrite original columns with numeric data for Excel export
-    # The " EGP" suffix will be applied by openpyxl's number formatting
-    df["Balance"] = df["Balance Numeric"]
-    df["Renewal Cost"] = df["Renewal Cost Numeric"]
-    df["Add-ons Price"] = df["Add-ons Price Numeric"]
-    df["Total Cost"] = df["Total Cost Numeric"]
-
+    df["Renewal Date DT"] = pd.to_datetime(df["Renewal Date"], format='%d-%m-%Y', errors='coerce')
     df["Remaining"] = pd.to_numeric(df["Remaining"], errors='coerce').fillna(0.0)
-    df["Used"] = pd.to_numeric(df["Used"], errors='coerce').fillna(0.0)
+    if 'Used' in df.columns:
+        df["Used"] = pd.to_numeric(df["Used"], errors='coerce').fillna(0.0)
+    else:
+        df["Used"] = 0.0
+        logging.warning("'Used' column not found in fetched data, defaulting to 0 for Main Quota calculation.")
     df["Main Quota"] = df["Remaining"] + df["Used"]
+    logging.info("DataFrame processed for alert logic.")
 
-    # Define final column order (no helper columns needed for this approach)
+    # --- SLACK ALERTS AND REPORTING LOGIC ---
+    individual_alerts_to_send = []
+    low_gb_alert_count = 0
+    renewal_low_balance_alert_count = 0
+
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        # STAGE 1: Always collect potential individual alerts and their counts
+        logging.info("Gathering data for all potential alerts...")
+        for index, row in df.iterrows():
+            if pd.notna(row['Remaining']) and row['Remaining'] < LOW_REMAINING_RED_GB:
+                message = (
+                    f":warning: *Low GB Alert!* Account: *{row['Store']}* ({row['Number']})\n"
+                    f"Remaining Data: *{row['Remaining']:.2f} GB* (Threshold: < {LOW_REMAINING_RED_GB} GB)"
+                )
+                individual_alerts_to_send.append(message)
+                low_gb_alert_count += 1
+
+        current_date_for_alerts = pd.Timestamp.now().normalize()
+        for index, row in df.iterrows():
+            renewal_date_dt = row['Renewal Date DT']
+            balance_numeric = row['Balance Numeric']
+            total_cost_numeric = row['Total Cost Numeric']
+            if pd.notna(renewal_date_dt):
+                days_to_renewal = (renewal_date_dt - current_date_for_alerts).days
+                if days_to_renewal <= 5 and balance_numeric < total_cost_numeric:
+                    renewal_date_str = row['Renewal Date']
+                    message = (
+                        f":alarm_clock: *Upcoming Renewal & Low Balance!* Account: *{row['Store']}* ({row['Number']})\n"
+                        f"Renews on: *{renewal_date_str}* (in {days_to_renewal} day(s))\n"
+                        f"Current Balance: *{balance_numeric:.2f} EGP*\n"
+                        f"Estimated Total Cost: *{total_cost_numeric:.2f} EGP*"
+                    )
+                    individual_alerts_to_send.append(message)
+                    renewal_low_balance_alert_count += 1
+
+        # STAGE 2: Decide what to send based on the current time
+        now = datetime.now()
+        target_summary_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
+        interval_minutes = 10
+        summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
+        summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
+
+        # For testing time logic:
+        # now = datetime.now().replace(hour=12, minute=5) # Test summary window
+        # now = datetime.now().replace(hour=13, minute=0) # Test individual/all-clear window
+
+        if summary_window_start <= now <= summary_window_end: # If in the 12 PM window for the summary report
+            logging.info(f"Current time {now.strftime('%H:%M')} is within the summary window. Sending daily summary Slack report ONLY.")
+            summary_report_parts = [f"*📊 Daily Usage Report Summary ({pd.Timestamp.now().strftime('%Y-%m-%d %I:%M %p')})*"]
+            summary_report_parts.append(f"Total accounts processed: *{len(df)}*")
+            if low_gb_alert_count > 0:
+                summary_report_parts.append(f":warning: *{low_gb_alert_count} account(s)* currently have Low GB (< {LOW_REMAINING_RED_GB} GB).")
+            else:
+                summary_report_parts.append(f":white_check_mark: All accounts currently OK for GB usage.")
+            if renewal_low_balance_alert_count > 0:
+                summary_report_parts.append(f":alarm_clock: *{renewal_low_balance_alert_count} account(s)* currently require attention for renewal and low balance.")
+            else:
+                summary_report_parts.append(f":white_check_mark: No immediate renewal/balance concerns at this time.")
+            # Add note about the email report if email is configured
+            if TO_ADDRS and EMAIL_SENDER and EMAIL_PASSWORD: # Check if email sending is configured
+                summary_report_parts.append(f"📧 _The detailed Excel report, containing full data for all accounts, has also been sent via email._")
+            else:
+                summary_report_parts.append(f"📧 _Email reporting is not configured._")
+            #summary_report_parts.append(f"\n_This is the consolidated daily summary. Check individual alerts sent at other times if issues were present._")
+            daily_summary_message = "\n".join(summary_report_parts)
+            send_slack_message(daily_summary_message)
+            logging.info("Sent daily summary report to Slack.")
+        
+        else: # Outside the 12 PM summary window
+            logging.info(f"Current time {now.strftime('%H:%M')} is outside the summary window. Checking for individual alerts or sending 'All Clear'.")
+            if individual_alerts_to_send:
+                logging.info(f"Sending {len(individual_alerts_to_send)} individual alert(s) to Slack...")
+                unique_individual_alerts = sorted(list(set(individual_alerts_to_send)))
+                for alert_msg in unique_individual_alerts:
+                    send_slack_message(alert_msg)
+                    await asyncio.sleep(1)
+            else: # No individual alerts to send, and it's not summary report time
+                logging.info("No individual data-driven alerts. Sending 'All Clear' message to Slack.")
+                all_clear_message = f"🎉 Good news! Your friendly WE Usage Watchdog just completed its {now.strftime('%I:%M %p')} rounds, and all accounts are A-OK! :dog2::shield: Time to relax and enjoy the peace of mind! ✨"
+                send_slack_message(all_clear_message)
+    # --- END: SLACK ALERTS AND REPORTING LOGIC ---
+
+    # --- Prepare DataFrame for Excel Output ---
+    df_for_excel = df.copy()
+    df_for_excel["Balance"] = df["Balance Numeric"]
+    df_for_excel["Renewal Cost"] = df["Renewal Cost Numeric"]
+    df_for_excel["Add-ons Price"] = df["Add-ons Price Numeric"]
+    df_for_excel["Total Cost"] = df["Total Cost Numeric"]
     final_columns = [
-        "Store",
-        "Number",
-        "Balance",
-        "Total Cost",       # Moved up
-        "Renewal Cost",
-        "Add-ons Price",
-        "Add-ons",
-        "Main Quota",
-        "Remaining",
-        "Renewal Date"
+        "Store", "Number", "Balance", "Main Quota", "Remaining",
+        "Add-ons", "Add-ons Price", "Renewal Cost", "Total Cost", "Renewal Date"
     ]
-    df = df[final_columns]
-    logging.info("DataFrame prepared.")
+    df_for_excel = df_for_excel[final_columns]
+    logging.info("DataFrame prepared for Excel export.")
 
     excel_path = "usage_report.xlsx"
-    df.to_excel(excel_path, index=False, sheet_name="Usage")
+    df_for_excel.to_excel(excel_path, index=False, sheet_name="Usage")
     logging.info(f"Data exported to {excel_path}.")
 
+    # --- Styling with openpyxl ---
     wb = load_workbook(excel_path)
     ws = wb.active
-
     center = Alignment(horizontal="center", vertical="center")
     for row_cells in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
         for cell in row_cells:
             cell.alignment = center
-
     header_row = ws[1]
     col_letters = {}
     for cell in header_row:
-        if cell.value:
-            col_letters[cell.value] = cell.column_letter
-
-    gb_format = '0" GB"'
-    egp_format = '#,##0.00" EGP"'
-
+        if cell.value: col_letters[cell.value] = cell.column_letter
+    gb_format = '0" GB"'; egp_format = '#,##0.00" EGP"'
     if "Main Quota" in col_letters:
-        for cell in ws[col_letters["Main Quota"]][1:]:
-            cell.number_format = gb_format
+        for cell in ws[col_letters["Main Quota"]][1:]: cell.number_format = gb_format
     if "Remaining" in col_letters:
-        for cell in ws[col_letters["Remaining"]][1:]:
-            cell.number_format = gb_format
-
+        for cell in ws[col_letters["Remaining"]][1:]: cell.number_format = gb_format
     currency_cols_for_formatting = ["Balance", "Add-ons Price", "Renewal Cost", "Total Cost"]
     for col_name in currency_cols_for_formatting:
         if col_name in col_letters:
-            for cell in ws[col_letters[col_name]][1:]:
-                cell.number_format = egp_format
-        else:
-            logging.warning(f"Column header '{col_name}' not found for EGP number formatting.")
-            
-    # --- Direct Cell Styling for Balance Column ---
+            for cell in ws[col_letters[col_name]][1:]: cell.number_format = egp_format
+        else: logging.warning(f"Column header '{col_name}' not found for EGP number formatting.")
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    
-    if "Balance" in col_letters and "Total Cost" in col_letters:
+    if "Balance" in col_letters:
         balance_col_letter_in_excel = col_letters["Balance"]
-        
-        # Iterate through the DataFrame rows to get numeric values for comparison
-        for df_idx, row_data in df.iterrows(): # df.iterrows() gives (index, Series)
-            excel_row_num = df_idx + 2 # +1 for header, +1 because Excel is 1-indexed
-
+        for df_idx in range(len(df)):
+            excel_row_num = df_idx + 2
             try:
-                # Use the numeric values directly from the DataFrame (which were already processed)
-                balance_val = row_data['Balance'] # This is now numeric
-                total_cost_val = row_data['Total Cost'] # This is now numeric
-                
+                balance_val = df.loc[df_idx, 'Balance Numeric']
+                total_cost_val = df.loc[df_idx, 'Total Cost Numeric']
                 balance_cell_in_excel = ws[f"{balance_col_letter_in_excel}{excel_row_num}"]
-
-                # Round for precise comparison of currency values
-                # Using a small epsilon for float equality comparison
-                epsilon = 1e-9 
-                if balance_val < (total_cost_val - epsilon): # balance_val < total_cost_val
-                    balance_cell_in_excel.fill = red_fill
-                elif abs(balance_val - total_cost_val) < epsilon: # balance_val == total_cost_val
-                    balance_cell_in_excel.fill = yellow_fill
-                # Else: no fill, default background
-            except KeyError as e:
-                logging.error(f"KeyError accessing DataFrame for styling at df_idx {df_idx}, Excel row {excel_row_num}: {e}")
-            except Exception as e:
-                logging.error(f"Error applying direct style at df_idx {df_idx}, Excel row {excel_row_num}: {e}")
+                epsilon = 1e-9
+                if balance_val < (total_cost_val - epsilon): balance_cell_in_excel.fill = red_fill
+                elif abs(balance_val - total_cost_val) < epsilon: balance_cell_in_excel.fill = yellow_fill
+            except KeyError as e: logging.error(f"KeyError accessing DataFrame for direct styling at df_idx {df_idx}, Excel row {excel_row_num}: {e}")
+            except Exception as e: logging.error(f"Error applying direct style at df_idx {df_idx}, Excel row {excel_row_num}: {e}")
         logging.info("Applied direct cell styling for Balance column based on Python logic.")
-    else:
-        logging.warning("Could not apply direct styling for Balance: 'Balance' or 'Total Cost' column header not found in col_letters.")
-
-
-    # Conditional formatting for Remaining GB (this part was working)
+    else: logging.warning("Could not apply direct styling for Balance: 'Balance' column header not found.")
     if "Remaining" in col_letters:
-        remaining_col_letter = col_letters["Remaining"]
-        last_row = ws.max_row
-        
+        remaining_col_letter = col_letters["Remaining"]; last_row = ws.max_row
         dxf_red_gb = DifferentialStyle(fill=PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid"))
         dxf_yellow_gb = DifferentialStyle(fill=PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"))
-
-        rule_red_gb = Rule(type="cellIs", operator="lessThan", formula=[str(LOW_REMAINING_RED_GB)], dxf=dxf_red_gb)
-        rule_red_gb.stopIfTrue = True
+        rule_red_gb = Rule(type="cellIs", operator="lessThan", formula=[str(LOW_REMAINING_RED_GB)], dxf=dxf_red_gb); rule_red_gb.stopIfTrue = True
         ws.conditional_formatting.add(f"{remaining_col_letter}2:{remaining_col_letter}{last_row}", rule_red_gb)
-
-        rule_yellow_gb = Rule(type="cellIs", operator="lessThan", formula=[str(LOW_REMAINING_YELLOW_GB)], dxf=dxf_yellow_gb)
-        rule_yellow_gb.stopIfTrue = True
+        rule_yellow_gb = Rule(type="cellIs", operator="lessThan", formula=[str(LOW_REMAINING_YELLOW_GB)], dxf=dxf_yellow_gb); rule_yellow_gb.stopIfTrue = True
         ws.conditional_formatting.add(f"{remaining_col_letter}2:{remaining_col_letter}{last_row}", rule_yellow_gb)
-
     logging.info("Excel file styled.")
     wb.save(excel_path)
 
-    yag = None
-    try:
-        if not TO_ADDRS:
-            logging.warning("No email recipients configured. Skipping email.")
-            return
+    # --- Time-Restricted Email Sending ---
+    now_for_email = datetime.now()
+    target_email_time = now_for_email.replace(hour=12, minute=0, second=0, microsecond=0)
+    interval_minutes_email = 10 
+    email_window_start = target_email_time - timedelta(minutes=interval_minutes_email)
+    email_window_end = target_email_time + timedelta(minutes=interval_minutes_email)
 
-        yag = yagmail.SMTP(EMAIL_SENDER, EMAIL_PASSWORD)
-        yag.send(
-            to=TO_ADDRS,
-            subject="📊 Usage & Balance Report",
-            contents="Please find today’s usage report attached.",
-            attachments=[excel_path]
-        )
-        logging.info(f"✅ Email sent to {TO_ADDRS} with {excel_path} attached.")
-    except Exception as e:
-        logging.error(f"Failed to send email: {e}", exc_info=True)
-    finally:
-        if yag:
-            try:
-                yag.close()
-            except Exception as e:
-                logging.error(f"Error closing yagmail connection: {e}")
+    # For testing:
+    # now_for_email = datetime.now().replace(hour=11, minute=55)
+
+    if email_window_start <= now_for_email <= email_window_end:
+        logging.info(f"Current time {now_for_email.strftime('%H:%M')} is within the email window. Attempting to send email report.")
+        yag = None
+        try:
+            if not TO_ADDRS: logging.warning("No email recipients configured. Email will not be sent.")
+            elif not EMAIL_SENDER or not EMAIL_PASSWORD: logging.warning("Email sender or password not configured. Email will not be sent.")
+            else:
+                yag = yagmail.SMTP(EMAIL_SENDER, EMAIL_PASSWORD)
+                yag.send(to=TO_ADDRS, subject=f"📊 Daily Usage & Balance Report - {now_for_email.strftime('%Y-%m-%d')}",
+                         contents=f"Please find today’s usage report attached (Generated around {now_for_email.strftime('%I:%M %p')}).",
+                         attachments=[excel_path])
+                logging.info(f"✅ Email sent to {TO_ADDRS} with {excel_path} attached.")
+        except Exception as e: logging.error(f"Failed to send email: {e}", exc_info=True)
+        finally:
+            if yag:
+                try: yag.close()
+                except Exception as e: logging.error(f"Error closing yagmail connection: {e}")
+    else:
+        logging.info(f"Current time {now_for_email.strftime('%H:%M')} is outside the designated email window. Email will not be sent.")
+
+# Ensure parse_egp_string and send_slack_message are defined globally or imported
+# from datetime import datetime, timedelta # Make sure this is at the top of your script
 
 if __name__ == "__main__":
     asyncio.run(main())
