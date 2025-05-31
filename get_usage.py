@@ -31,8 +31,8 @@ load_dotenv()
 BROWSER_LAUNCH_ARGS = [
     '--no-sandbox',
     '--disable-setuid-sandbox',
-    '--disable-dev-shm-usage', # Often useful in constrained Linux environments
-    '--disable-gpu',           # Good for headless
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
 ]
 
 # ── Slack settings ───────────────────────────────────────────────────────────
@@ -52,7 +52,6 @@ EMAIL_RECIPIENTS = [
     if addr.strip()
 ]
 TO_ADDRS = EMAIL_RECIPIENTS or ([EMAIL_RECIPIENT] if EMAIL_RECIPIENT else [])
-# Not raising error for no email recipients as email sending is time-conditional
 
 # ── Conditional Formatting Thresholds ────────────────────────────────────────
 LOW_REMAINING_YELLOW_GB = float(os.getenv("LOW_REMAINING_YELLOW_GB", "80"))
@@ -79,12 +78,11 @@ async def fetch_usage(account, browser): # Accepts shared browser instance
     context = None
     try:
         logging.info(f"Processing account: {account['store']} ({account['phone']}) using shared browser")
-        # Create a new incognito-like context for each task for isolation
         context = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/90.0.4430.212 Safari/537.36" # Example user agent
+                "Chrome/90.0.4430.212 Safari/537.36"
             )
         )
         page = await context.new_page()
@@ -99,7 +97,7 @@ async def fetch_usage(account, browser): # Accepts shared browser instance
         logging.info(f"Login initiated for {account['phone']}")
 
         await page.wait_for_load_state("networkidle", timeout=60000)
-        await page.wait_for_timeout(3000) # Give elements time to fully render
+        await page.wait_for_timeout(3000) 
         logging.info(f"Dashboard loaded for {account['phone']}")
 
         balance = "0"
@@ -231,7 +229,8 @@ async def fetch_usage(account, browser): # Accepts shared browser instance
         if context:
             try: await context.close()
             except Exception as e_cc: logging.debug(f"Error closing context for {account['phone']}: {e_cc}")
-        logging.info(f"Finished processing task for {account['phone']}.") # More generic than "Finished processing [phone]"
+        logging.info(f"Finished processing task for {account['phone']}.")
+
 
 def parse_egp_string(cost_str):
     if not isinstance(cost_str, str) or cost_str.lower() == "n/a":
@@ -254,7 +253,7 @@ def send_slack_message(message_text):
     try:
         client = WebClient(token=SLACK_BOT_TOKEN)
         client.chat_postMessage(channel=SLACK_CHANNEL_ID, text=message_text)
-        logging.info(f"Message sent to Slack channel {SLACK_CHANNEL_ID}.") # Removed message_text for brevity
+        logging.info(f"Message sent to Slack channel {SLACK_CHANNEL_ID}.")
         return True
     except SlackApiError as e:
         logging.error(f"Error sending message to Slack: {e.response['error']}")
@@ -265,44 +264,55 @@ async def main():
     if not accounts:
         logging.warning("No accounts found in .env file. Exiting."); return
 
-    # Single browser instance strategy
+    # --- Concurrency Settings ---
+    CONCURRENCY_LIMIT = 3 # Adjust as needed for your EC2 instance size (e.g., 1, 2, or 3)
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+
+    async def limited_fetch_usage(account, browser, semaphore):
+        async with semaphore:
+            logging.info(f"Semaphore acquired for {account['store']}, starting fetch_usage.")
+            result = await fetch_usage(account, browser)
+            logging.info(f"Semaphore released for {account['store']}.")
+            return result
+
+    rows = []
     async with async_playwright() as p:
-        browser = None # Initialize browser to None
+        browser = None
         try:
             logging.info("Playwright started. Launching a single browser instance...")
             browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
             logging.info("Single browser instance launched.")
 
-            tasks = [fetch_usage(ac, browser) for ac in accounts]
+            tasks = [limited_fetch_usage(ac, browser, semaphore) for ac in accounts]
             rows = await asyncio.gather(*tasks)
             
         except Exception as e:
             logging.error(f"Error during Playwright browser setup or scraping tasks: {e}", exc_info=True)
-            # Create error rows if scraping failed fundamentally
             rows = [{
                 "Store": acc["store"], "Number": acc["phone"], "Balance": "Scrape Error",
                 "Remaining": 0, "Used": 0, "Add-ons": "Scrape Error", "Add-ons Price": "Scrape Error",
                 "Renewal Cost": "Scrape Error", "Renewal Date": "Scrape Error"
             } for acc in accounts]
-        # ...
+        # ... inside async def main(): ...
         finally:
-            if browser: # Check if browser object exists
+            if browser: # Check if the browser object was assigned
                 try:
-                    if browser.is_connected(): # A more common way to check if it's still active
-                        logging.info("Closing browser instance...")
-                        await browser.close()
-                    else:
-                        logging.info("Browser was not connected or already closed.")
+                    logging.info("Attempting to close browser instance...")
+                    await browser.close()
+                    logging.info("Browser instance closed.")
                 except Exception as e:
+                # Log if there's an issue during close, but don't crash
                     logging.error(f"Error trying to close browser: {e}")
-            # p.stop() is handled by 'async with'
+        # p.stop() is handled by 'async with async_playwright() as p:'
             logging.info("Playwright operations finished.")
         
-        logging.info(f"Finished scraping phase. Processed {len(rows)} potential account data sets.")
+    logging.info(f"Finished scraping phase. Processed {len(rows)} potential account data sets.")
 
     df = pd.DataFrame(rows)
     if df.empty:
         logging.warning("DataFrame is empty after scraping. Exiting.")
+        if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID: # Also send Slack alert if DF is empty
+            send_slack_message(":x: CRITICAL ERROR: Script finished but no data was collected. Please check logs on the server.")
         return
 
     # --- Process DataFrame for Calculations and Alerts ---
@@ -318,13 +328,11 @@ async def main():
     logging.info("DataFrame processed for alert logic.")
 
     # --- SLACK ALERTS AND REPORTING LOGIC ---
-    # ... (This entire block from your last provided script for Slack alerts,
-    #      including STAGE 1 and STAGE 2 with time checks, goes here) ...
-    individual_alerts_to_send = [] 
+    individual_alerts_to_send = []
     low_gb_alert_count = 0
     renewal_low_balance_alert_count = 0
 
-    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID: 
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         logging.info("Gathering data for all potential alerts...")
         for index, row in df.iterrows():
             if pd.notna(row['Remaining']) and row['Remaining'] < LOW_REMAINING_RED_GB:
@@ -349,7 +357,7 @@ async def main():
         interval_minutes = 10
         summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
-        now = datetime.now().replace(hour=12, minute=5) # Test summary window
+        now = datetime.now().replace(hour=11, minute=55)
         if summary_window_start <= now <= summary_window_end:
             logging.info(f"Current time {now.strftime('%H:%M')} is within the 12 PM summary window. Sending daily summary Slack report ONLY.")
             summary_report_parts = [f"*📊 Daily Usage Report Summary ({pd.Timestamp.now().strftime('%Y-%m-%d %I:%M %p')})*"]
@@ -406,13 +414,13 @@ async def main():
         else: logging.warning(f"Column header '{col_name}' not found for EGP number formatting.")
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-    if "Balance" in col_letters: # This should use the main df's numeric columns for comparison logic
+    if "Balance" in col_letters:
         balance_col_letter_in_excel = col_letters["Balance"]
-        for df_idx in range(len(df)): # Iterate using original df's length
+        for df_idx in range(len(df)): # Iterate based on original df which has ... Numeric columns
             excel_row_num = df_idx + 2
             try:
-                balance_val = df.loc[df_idx, 'Balance Numeric'] # Use Numeric from original df
-                total_cost_val = df.loc[df_idx, 'Total Cost Numeric'] # Use Numeric from original df
+                balance_val = df.loc[df_idx, 'Balance Numeric'] 
+                total_cost_val = df.loc[df_idx, 'Total Cost Numeric']
                 balance_cell_in_excel = ws[f"{balance_col_letter_in_excel}{excel_row_num}"]
                 epsilon = 1e-9
                 if balance_val < (total_cost_val - epsilon): balance_cell_in_excel.fill = red_fill
