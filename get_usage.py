@@ -420,7 +420,7 @@ async def main():
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
 
         # For testing time logic:
-        now = datetime.now().replace(hour=12, minute=5) # Test summary window
+        # now = datetime.now().replace(hour=12, minute=5) # Test summary window
         # now = datetime.now().replace(hour=13, minute=0) # Test individual/all-clear window
 
         if summary_window_start <= now <= summary_window_end: # If in the 12 PM window for the summary report
