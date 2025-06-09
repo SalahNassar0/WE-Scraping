@@ -11,7 +11,7 @@ from openpyxl.styles import Alignment, PatternFill, Font
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.formatting.rule import Rule
 from datetime import datetime, timedelta
-import yagmail # Ensure yagmail is imported
+import yagmail
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
@@ -53,6 +53,7 @@ EMAIL_RECIPIENTS = [
 ]
 TO_ADDRS = EMAIL_RECIPIENTS or ([EMAIL_RECIPIENT] if EMAIL_RECIPIENT else [])
 
+
 # ── Conditional Formatting Thresholds ────────────────────────────────────────
 LOW_REMAINING_YELLOW_GB = float(os.getenv("LOW_REMAINING_YELLOW_GB", "80"))
 LOW_REMAINING_RED_GB    = float(os.getenv("LOW_REMAINING_RED_GB", "20"))
@@ -73,22 +74,32 @@ if not accounts:
     logging.warning("No accounts configured! Please set ACCOUNT1_PHONE, ACCOUNT1_PASS, etc., in .env")
     
 
-# ── Scraper (Modified for shared browser) ──────────────────────────────────
+# ── Scraper ──────────────────────────────────
 async def fetch_usage(account, browser):
     page = None
     context = None
     # Default payload, updated upon successful scraping
     result_payload = {
-        "Store": account["store"], "Number": account["phone"], "Balance": "0 EGP (Not Found)",
-        "Remaining": 0.0, "Used": 0.0, "Add-ons": "N/A (No Details)", 
-        "Add-ons Price": "N/A (No Details)", "Renewal Cost": "0 EGP (No Details)", 
+        "Store": account["store"], 
+        "Number": account["phone"], 
+        "Balance": "0 EGP (Not Found)",
+        "Remaining": 0.0, "Used": 0.0, 
+        "Add-ons": "N/A (No Details)", 
+        "Add-ons Price": "N/A (No Details)",
+        "Renewal Cost": "0 EGP (No Details)", 
         "Renewal Date": "(No Details)"
     }
     # Error payload structure if a critical, unrecoverable failure occurs for this account
     critical_error_payload = {
-        "Store": account["store"], "Number": account["phone"], "Balance": "Error EGP", # Key marker
-        "Remaining": 0.0, "Used": 0.0, "Add-ons": "Error", # Key marker
-        "Add-ons Price": "Error", "Renewal Cost": "Error EGP", "Renewal Date": "Error"
+        "Store": account["store"], 
+        "Number": account["phone"], 
+        "Balance": "Error EGP", 
+        "Remaining": 0.0, 
+        "Used": 0.0, 
+        "Add-ons": "Error",
+        "Add-ons Price": "Error", 
+        "Renewal Cost": "Error EGP",
+        "Renewal Date": "Error"
     }
 
     try:
@@ -110,8 +121,7 @@ async def fetch_usage(account, browser):
         await page.wait_for_timeout(7000) 
         
         try:
-            # Replace 'div.content-wrapper' with a selector for a core element
-            # that *always* appears on a successfully loaded dashboard. This is just an example.
+            # Wait for the main dashboard content area to load
             await page.wait_for_selector('//span[normalize-space(text())="Current Balance"]/parent::div', timeout=30000) 
             logging.info(f"Main dashboard content area detected for {account['phone']}")
         except Exception as e:
@@ -255,22 +265,23 @@ async def main():
         return
 
     rows = []
-    # Single browser instance strategy
+    # AWS instance have low specs so we only use a single browser instance and limit concurrency
     async with async_playwright() as p:
         browser = None
+        logging.info("Initializing Playwright...")
         try:
             logging.info("Playwright started. Launching single browser instance...")
             browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
             logging.info("Single browser instance launched.")
             
-            CONCURRENCY_LIMIT = 3 # Adjust as needed (e.g., 1, 2, or 3)
+            CONCURRENCY_LIMIT = 3 # Adjust as needed (e.g., 1, 2, or the max your instance can handle)
             semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
             async def limited_fetch_usage(account, browser, semaphore):
                 async with semaphore:
-                    # logging.info(f"Semaphore acquired for {account['store']}, starting fetch_usage.") # Can be verbose
+                    logging.info(f"Semaphore acquired for {account['store']}, starting fetch_usage.")
                     result = await fetch_usage(account, browser)
-                    # logging.info(f"Semaphore released for {account['store']}.") # Can be verbose
+                    logging.info(f"Semaphore released for {account['store']}.")
                     return result
             
             tasks = [limited_fetch_usage(ac, browser, semaphore) for ac in accounts]
@@ -287,7 +298,7 @@ async def main():
                     yag.send(to=TO_ADDRS, subject="🚨 CRITICAL: WE Scraper Script Execution Failed!", contents=critical_msg)
                     if yag: yag.close()
                 except Exception as email_err: logging.error(f"Failed to send critical failure email: {email_err}")
-            return # Exit script entirely on such a fundamental failure
+            return 
         finally:
             if browser and browser.is_connected():
                 try: 
@@ -299,14 +310,14 @@ async def main():
         
     logging.info(f"Finished scraping phase. Processed {len(rows)} accounts.")
 
-    if not rows and accounts: # Should be caught by above if accounts is not empty, but as a safeguard
+    if not rows and accounts: #a safeguard
         logging.error("No data rows returned from scraping tasks, despite having accounts. Exiting.")
         if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
             send_slack_message(":x: SCRIPT ERROR: No data rows returned from scraping tasks (gather might have failed or been cancelled early). Please check logs.")
         return
     elif not accounts: # Should have been caught at the very top of main()
         logging.info("No accounts were configured to process.")
-        return # Already logged, just exit.
+        return 
 
     # --- Check if ALL accounts critically failed within fetch_usage ---
     critically_failed_accounts_count = 0
@@ -393,7 +404,7 @@ async def main():
         interval_minutes = 10
         summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
-        
+        # now = datetime.now().replace(hour=12, minute=5) # Test summary window
         is_summary_time_window = summary_window_start <= now <= summary_window_end
 
         if is_summary_time_window:
@@ -522,10 +533,9 @@ async def main():
 
     # Use critically_failed_accounts_count determined earlier (counts "Error EGP" AND "Error" in Addons from rows)
     send_email_due_to_some_failures = critically_failed_accounts_count > 0 
-                                       # (and critically_failed_accounts_count < len(rows) because the "all fail" case exits)
-
-
+    # (and critically_failed_accounts_count < len(rows) because the "all fail" case exits)
     email_subject = ""; email_contents = ""; should_send_this_email = False
+    # now_for_dispatch = datetime.now().replace(hour=12, minute=5) # Test summary window
 
     if is_daily_email_time:
         should_send_this_email = True
