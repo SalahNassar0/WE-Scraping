@@ -14,6 +14,37 @@ from datetime import datetime, timedelta
 import yagmail
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+import shutil
+from pathlib import Path
+
+def archive_daily_report():
+    """Archive today's report with date in filename"""
+    from datetime import datetime
+    import shutil
+    
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    archive_path = f"usage_report_{today_str}.xlsx"
+    
+    try:
+        shutil.copyfile("usage_report.xlsx", archive_path)
+        logging.info(f"Archived daily report as {archive_path}")
+    except Exception as e:
+        logging.error(f"Failed to archive daily report: {e}")
+
+def save_to_csv(df_for_excel):
+    """Save daily report to CSV for dashboard"""
+    csv_path = Path("daily_reports.csv")
+    
+    # Add date column
+    df_for_excel['date'] = pd.Timestamp.now().date()
+    
+    # Append to CSV (create if doesn't exist)
+    if csv_path.exists():
+        df_for_excel.to_csv(csv_path, mode='a', header=False, index=False)
+    else:
+        df_for_excel.to_csv(csv_path, mode='w', header=True, index=False)
+    
+    logging.info(f"Daily report saved to {csv_path}")
 
 # ── Configure Logging ────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -523,6 +554,9 @@ async def main():
         ws.conditional_formatting.add(f"{remaining_col_letter}2:{remaining_col_letter}{last_row}", rule_yellow_gb)
     logging.info("Excel file styled."); wb.save(excel_path)
 
+    archive_daily_report()
+    save_to_csv(df_for_excel)
+
     # --- Email Sending Logic ---
     now_for_dispatch = datetime.now() 
     target_daily_email_time = now_for_dispatch.replace(hour=12, minute=0, second=0, microsecond=0)
@@ -575,3 +609,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+   
