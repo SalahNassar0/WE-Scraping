@@ -426,7 +426,7 @@ async def main():
                pd.notna(row['Total Cost Numeric']) and \
                row['Renewal Cost'] != "Error EGP": # Additional check that renewal cost was actually scraped
                 days_to_renewal = (row['Renewal Date DT'] - current_date_for_alerts).days
-                if days_to_renewal <= 30 and row['Balance Numeric'] < row['Total Cost Numeric']:
+                if days_to_renewal <= 20 and row['Balance Numeric'] < row['Total Cost Numeric']:
                     message = (f":alarm_clock: *Low Balance!* Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*"); 
                     individual_alerts_to_send.append(message); renewal_low_balance_alert_count += 1
         
