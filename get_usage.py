@@ -367,16 +367,7 @@ async def main():
         )
         logging.error(all_failed_msg)
         if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID: send_slack_message(all_failed_msg)
-        
-        # Also email this critical "all accounts failed" alert if configured
-        if TO_ADDRS and EMAIL_SENDER and EMAIL_PASSWORD:
-            try:
-                yag_fail = yagmail.SMTP(EMAIL_SENDER, EMAIL_PASSWORD)
-                yag_fail.send(to=TO_ADDRS, subject="⚠️ URGENT: WE Scraper - All Accounts Failed Data Retrieval!", contents=all_failed_msg)
-                if yag_fail: yag_fail.close()
-            except Exception as email_err: 
-                logging.error(f"Failed to send 'all accounts failed' email: {email_err}")
-        
+        # Do NOT send any email if all accounts failed
         logging.info("Exiting script due to critical failure on all accounts. No Excel report will be generated.")
         return # Stop further processing
     
@@ -412,13 +403,13 @@ async def main():
     # Alerts should only be generated from these non-critically-failed rows.
     successful_scrape_mask = df["Balance"] != "Error EGP" 
 
+    summary_or_mixed_sent = False
     if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         logging.info("Gathering data for Slack alerts from non-critically-failed accounts..."); 
         for index, row in df[successful_scrape_mask].iterrows(): 
             if pd.notna(row['Remaining']) and row['Remaining'] < LOW_REMAINING_RED_GB :
                 message = (f":warning: *Low GB Alert!* Acct: *{row['Store']}* ({row['Number']}) - Rem: *{row['Remaining']:.2f}GB*"); 
                 individual_alerts_to_send.append(message); low_gb_alert_count += 1
-        
         current_date_for_alerts = pd.Timestamp.now().normalize()
         for index, row in df[successful_scrape_mask].iterrows():
             if pd.notna(row['Renewal Date DT']) and \
@@ -429,15 +420,12 @@ async def main():
                 if days_to_renewal <= 20 and row['Balance Numeric'] < row['Total Cost Numeric']:
                     message = (f":alarm_clock: *Low Balance!* Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*"); 
                     individual_alerts_to_send.append(message); renewal_low_balance_alert_count += 1
-        
         now = datetime.now()
         target_summary_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
         interval_minutes = 10
         summary_window_start = target_summary_time - timedelta(minutes=interval_minutes)
         summary_window_end = target_summary_time + timedelta(minutes=interval_minutes)
-        # now = datetime.now().replace(hour=12, minute=5) # Test summary window
         is_summary_time_window = summary_window_start <= now <= summary_window_end
-
         if is_summary_time_window:
             logging.info(f"Time {now.strftime('%H:%M')} is in 12PM summary window. Sending summary ONLY to Slack.")
             summary_parts = [f"*📊 Daily Usage Report Summary ({pd.Timestamp.now().strftime('%Y-%m-%d %I:%M %p')})*"]
@@ -446,20 +434,18 @@ async def main():
             else: summary_parts.append(f":white_check_mark: No accounts with Low GB (among those successfully checked).")
             if renewal_low_balance_alert_count > 0: summary_parts.append(f":alarm_clock: *{renewal_low_balance_alert_count} account(s)* require Renewal/Low Balance attention.")
             else: summary_parts.append(f":white_check_mark: No Renewal/Low Balance concerns (among those successfully checked).")
-            
             accounts_with_errors = len(df) - successful_scrape_mask.sum() # Count of "Error EGP" rows
             if accounts_with_errors > 0 :
                  summary_parts.append(f":exclamation: *{accounts_with_errors} account(s)* had critical data retrieval issues (marked 'Error' in report).")
-
             if successful_scrape_mask.sum() == len(df) and low_gb_alert_count == 0 and renewal_low_balance_alert_count == 0 : 
                 summary_parts.append(f"\nOverall: :thumbsup: All accounts successfully processed and looking good!")
-            
             if TO_ADDRS and EMAIL_SENDER and EMAIL_PASSWORD: 
                 summary_parts.append(f"📧 _The detailed Excel report, containing full data for all accounts, has also been sent via email._")
             else: 
                 summary_parts.append(f"📧 _Email reporting is not configured._")
             send_slack_message("\n".join(summary_parts))
             logging.info("Daily summary sent to Slack.")
+            summary_or_mixed_sent = True
         else: # Not summary window
             logging.info(f"Time {now.strftime('%H:%M')} is outside 12PM summary window. Sending individual/all-clear/mixed status.")
             if individual_alerts_to_send: 
@@ -483,10 +469,16 @@ async def main():
                         f"- No specific Low GB or Renewal/Low Balance alerts for successfully checked accounts.\n"
                         f"- However, data retrieval issues were encountered for the following *{accounts_that_had_errors} account(s)*:\n"
                         f"{failed_accounts_str}\n"
-                        f"📧 Please check your email for the full report, which includes details for all accounts."
                     )
                     send_slack_message(mixed_status_message)
-    
+                    summary_or_mixed_sent = True
+    # --- Send direct alerts for failed accounts (data retrieval errors) ---
+    if not summary_or_mixed_sent:
+        for index, failed_row in df[~successful_scrape_mask].iterrows():
+            error_message = f":x: *Data Retrieval Error!* Acct: *{failed_row['Store']}* ({failed_row['Number']})\n"
+            send_slack_message(error_message)
+            await asyncio.sleep(1)
+
     # --- Prepare DataFrame for Excel Output ---
     df_for_excel = df.copy() 
     df_for_excel["Balance"] = df["Balance Numeric"]
@@ -576,22 +568,14 @@ async def main():
         email_subject = f"📊 Daily Usage & Balance Report - {now_for_dispatch.strftime('%Y-%m-%d')}"
         email_contents = f"Please find today’s usage report attached (Generated around {now_for_dispatch.strftime('%I:%M %p')})."
         if send_email_due_to_some_failures: # It's daily report time AND there were some critical failures
-             email_contents += f"\n\nNOTE: {critically_failed_accounts_count} account(s) encountered critical errors during data retrieval. Please check the report for details marked 'Error'."
+            email_contents += f"\n\nNOTE: {critically_failed_accounts_count} account(s) encountered critical errors during data retrieval. Please check the report for details marked 'Error'."
         logging.info(f"Time {now_for_dispatch.strftime('%H:%M')} is in the daily email window.")
-    
-    elif send_email_due_to_some_failures: # Not daily report time, but there were critical failures
-        should_send_this_email = True
-        email_subject = f"⚠️ WE Usage Report - Data Retrieval Issues Detected - {now_for_dispatch.strftime('%Y-%m-%d %H:%M')}"
-        email_contents = (
-            f"{critically_failed_accounts_count} account(s) encountered critical errors during data retrieval. "
-            f"The attached report contains details for all accounts, including error markers for these failed ones.\n\n"
-            f"(Report generated on {now_for_dispatch.strftime('%Y-%m-%d at %I:%M %p')})."
-        )
-        logging.info(f"{critically_failed_accounts_count} account(s) failed critically. Preparing failure report email.")
 
     if should_send_this_email:
-        if not TO_ADDRS: logging.warning("No email recipients configured. Skipping email.")
-        elif not EMAIL_SENDER or not EMAIL_PASSWORD: logging.warning("Email sender or password not configured. Skipping email.")
+        if not TO_ADDRS:
+            logging.warning("No email recipients configured. Skipping email.")
+        elif not EMAIL_SENDER or not EMAIL_PASSWORD:
+            logging.warning("Email sender or password not configured. Skipping email.")
         else:
             yag = None
             try:
@@ -599,13 +583,16 @@ async def main():
                 yag = yagmail.SMTP(EMAIL_SENDER, EMAIL_PASSWORD)
                 yag.send(to=TO_ADDRS, subject=email_subject, contents=email_contents, attachments=[excel_path])
                 logging.info(f"✅ Email sent to {TO_ADDRS} with {excel_path} attached.")
-            except Exception as e: logging.error(f"Failed to send email: {e}", exc_info=True)
+            except Exception as e:
+                logging.error(f"Failed to send email: {e}", exc_info=True)
             finally:
                 if yag:
-                    try: yag.close()
-                    except Exception as e: logging.error(f"Error closing yagmail connection: {e}")
+                    try:
+                        yag.close()
+                    except Exception as e:
+                        logging.error(f"Error closing yagmail connection: {e}")
     else:
-        logging.info(f"No conditions met for sending email report at {now_for_dispatch.strftime('%H:%M')}.")
+        logging.info(f"No conditions met for sending email report at {now_for_dispatch.strftime('%H:%M')}")
 
 if __name__ == "__main__":
     asyncio.run(main())
