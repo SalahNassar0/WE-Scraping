@@ -406,10 +406,12 @@ async def main():
     summary_or_mixed_sent = False
     if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         logging.info("Gathering data for Slack alerts from non-critically-failed accounts..."); 
+        low_gb_alerts = []
+        low_balance_alerts = []
         for index, row in df[successful_scrape_mask].iterrows(): 
             if pd.notna(row['Remaining']) and row['Remaining'] < LOW_REMAINING_RED_GB :
-                message = (f":warning: *Low GB Alert!* Acct: *{row['Store']}* ({row['Number']}) - Rem: *{row['Remaining']:.2f}GB*"); 
-                individual_alerts_to_send.append(message); low_gb_alert_count += 1
+                message = (f":warning: Acct: *{row['Store']}* ({row['Number']}) - Rem: *{row['Remaining']:.2f}GB*"); 
+                low_gb_alerts.append(message); low_gb_alert_count += 1
         current_date_for_alerts = pd.Timestamp.now().normalize()
         for index, row in df[successful_scrape_mask].iterrows():
             if pd.notna(row['Renewal Date DT']) and \
@@ -418,8 +420,8 @@ async def main():
                row['Renewal Cost'] != "Error EGP": # Additional check that renewal cost was actually scraped
                 days_to_renewal = (row['Renewal Date DT'] - current_date_for_alerts).days
                 if days_to_renewal <= 20 and row['Balance Numeric'] < row['Total Cost Numeric']:
-                    message = (f":alarm_clock: *Low Balance!* Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*"); 
-                    individual_alerts_to_send.append(message); renewal_low_balance_alert_count += 1
+                    message = (f":alarm_clock: Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*"); 
+                    low_balance_alerts.append(message); renewal_low_balance_alert_count += 1
         now = datetime.now()
         target_summary_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
         interval_minutes = 10
@@ -447,12 +449,14 @@ async def main():
             logging.info("Daily summary sent to Slack.")
             summary_or_mixed_sent = True
         else: # Not summary window
-            logging.info(f"Time {now.strftime('%H:%M')} is outside 12PM summary window. Sending individual/all-clear/mixed status.")
-            if individual_alerts_to_send: 
-                unique_alerts = sorted(list(set(individual_alerts_to_send)))
-                logging.info(f"Sending {len(unique_alerts)} unique individual alert(s) to Slack.")
-                for alert_msg in unique_alerts: send_slack_message(alert_msg); await asyncio.sleep(1)
-            else: # No individual alerts from successful scrapes. Now check if all scrapes were successful.
+            logging.info(f"Time {now.strftime('%H:%M')} is outside 12PM summary window. Sending grouped alerts by type.")
+            if low_gb_alerts:
+                low_gb_message = '*:warning: Low GB Alerts:*\n' + '\n'.join(low_gb_alerts)
+                send_slack_message(low_gb_message)
+            if low_balance_alerts:
+                low_balance_message = '*:alarm_clock: Low Balance Alerts:*\n' + '\n'.join(low_balance_alerts)
+                send_slack_message(low_balance_message)
+            if not low_gb_alerts and not low_balance_alerts:
                 accounts_that_had_errors = len(df) - successful_scrape_mask.sum()
                 if accounts_that_had_errors == 0: # All accounts were scraped successfully AND no individual alerts
                     logging.info("No individual data-driven alerts. All accounts scraped successfully. Sending 'All Clear' message.")
