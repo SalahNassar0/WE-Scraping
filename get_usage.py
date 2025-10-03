@@ -151,6 +151,15 @@ async def fetch_usage(account, browser):
         await page.wait_for_load_state("networkidle", timeout=70000) 
         await page.wait_for_timeout(7000) 
         
+        # Check for and close popup ad if it appears
+        try:
+            popup_close_selector = 'div[style*="position: absolute; right: 1rem; top: 1.5rem"] span[role="img"] svg'
+            await page.wait_for_selector(popup_close_selector, timeout=6000)
+            await page.click(popup_close_selector)
+            logging.info(f"Popup ad detected and closed for {account['phone']}")
+        except Exception:
+            logging.info(f"No popup ad detected for {account['phone']} within 6 seconds, continuing...")
+        
         try:
             # Wait for the main dashboard content area to load
             await page.wait_for_selector('//span[normalize-space(text())="Current Balance"]/parent::div', timeout=30000) 
@@ -302,7 +311,7 @@ async def main():
         logging.info("Initializing Playwright...")
         try:
             logging.info("Playwright started. Launching single browser instance...")
-            browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
+            browser = await p.chromium.launch(headless=False, args=BROWSER_LAUNCH_ARGS)
             logging.info("Single browser instance launched.")
             
             CONCURRENCY_LIMIT = 3 # Adjust as needed (e.g., 1, 2, or the max your instance can handle)
@@ -420,7 +429,11 @@ async def main():
                row['Renewal Cost'] != "Error EGP": # Additional check that renewal cost was actually scraped
                 days_to_renewal = (row['Renewal Date DT'] - current_date_for_alerts).days
                 if days_to_renewal <= 20 and row['Balance Numeric'] < row['Total Cost Numeric']:
-                    message = (f":alarm_clock: Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*"); 
+                    remaining_gb = row['Remaining'] if pd.notna(row['Remaining']) else 0.0
+                    if remaining_gb < 80:
+                        message = (f":alarm_clock: Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*, Remaining: *{remaining_gb:.2f}GB* - ⚠️ *This line might need renewal soon and no balance available to renew*"); 
+                    else:
+                        message = (f":alarm_clock: Acct: *{row['Store']}* ({row['Number']}) - Renews: *{row['Renewal Date']}* ({days_to_renewal}d) - Balance: *{row['Balance Numeric']:.2f}*, Cost: *{row['Total Cost Numeric']:.2f}*, Remaining: *{remaining_gb:.2f}GB*"); 
                     low_balance_alerts.append(message); renewal_low_balance_alert_count += 1
         now = datetime.now()
         target_summary_time = now.replace(hour=12, minute=0, second=0, microsecond=0)
@@ -565,7 +578,7 @@ async def main():
     send_email_due_to_some_failures = critically_failed_accounts_count > 0 
     # (and critically_failed_accounts_count < len(rows) because the "all fail" case exits)
     email_subject = ""; email_contents = ""; should_send_this_email = False
-    # now_for_dispatch = datetime.now().replace(hour=12, minute=5) # Test summary window
+    #now_for_dispatch = datetime.now().replace(hour=12, minute=5) # Test summary window
 
     if is_daily_email_time:
         should_send_this_email = True
