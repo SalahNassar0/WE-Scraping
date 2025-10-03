@@ -311,7 +311,7 @@ async def main():
         logging.info("Initializing Playwright...")
         try:
             logging.info("Playwright started. Launching single browser instance...")
-            browser = await p.chromium.launch(headless=False, args=BROWSER_LAUNCH_ARGS)
+            browser = await p.chromium.launch(headless=True, args=BROWSER_LAUNCH_ARGS)
             logging.info("Single browser instance launched.")
             
             CONCURRENCY_LIMIT = 3 # Adjust as needed (e.g., 1, 2, or the max your instance can handle)
